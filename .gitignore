@@ -1,0 +1,11 @@
+/build*/
+/dist/
+/.vs/
+/test_output/
+*.part
+*.state
+*.new
+*.user
+*.suo
+*.log
+.cst-*
