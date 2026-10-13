@@ -220,30 +220,30 @@ std::wstring stateStem(uint64_t id, const std::string &name) {
     suffix << std::hex << std::setfill(L'0') << std::setw(8) << nameCrc;
     return L".cst-" + hexId(id) + L"-" + suffix.str();
 }
-bool bit(const std::array<uint8_t, WindowChunks / 8> &bits, unsigned n) {
+bool bit(const std::vector<uint8_t> &bits, unsigned n) {
     return (bits[n / 8] >> (n % 8)) & 1;
 }
-void setBit(std::array<uint8_t, WindowChunks / 8> &bits, unsigned n) {
+void setBit(std::vector<uint8_t> &bits, unsigned n) {
     bits[n / 8] |= uint8_t(1u << (n % 8));
 }
-uint64_t chunks(uint64_t size) {
-    return size / PayloadBytes + (size % PayloadBytes != 0);
+uint64_t chunks(uint64_t size, const Encoding &e = {}) {
+    return size / e.payloadBytes() + (size % e.payloadBytes() != 0);
 }
-uint64_t windows(uint64_t size) {
-    uint64_t n = chunks(size);
-    return n / WindowChunks + (n % WindowChunks != 0);
+uint64_t windows(uint64_t size, const Encoding &e = {}) {
+    uint64_t n = chunks(size, e);
+    return n / e.windowChunks() + (n % e.windowChunks() != 0);
 }
-unsigned inWindow(uint64_t size, uint64_t window) {
-    uint64_t n = chunks(size), first = window * uint64_t(WindowChunks);
-    return first >= n ? 0 : unsigned(std::min<uint64_t>(WindowChunks, n - first));
+unsigned inWindow(uint64_t size, uint64_t window, const Encoding &e = {}) {
+    uint64_t n = chunks(size, e), first = window * uint64_t(e.windowChunks());
+    return first >= n ? 0 : unsigned(std::min<uint64_t>(e.windowChunks(), n - first));
 }
-unsigned bytesFor(uint64_t size, uint64_t chunk) {
-    if (chunk >= chunks(size))
+unsigned bytesFor(uint64_t size, uint64_t chunk, const Encoding &e = {}) {
+    if (chunk >= chunks(size, e))
         return 0;
-    return unsigned(std::min<uint64_t>(PayloadBytes, size - chunk * uint64_t(PayloadBytes)));
+    return unsigned(std::min<uint64_t>(e.payloadBytes(), size - chunk * uint64_t(e.payloadBytes())));
 }
-bool frameDone(const std::array<uint8_t, WindowChunks / 8> &bits, unsigned frame, unsigned n) {
-    unsigned begin = frame * Slots, end = std::min(n, begin + Slots);
+bool frameDone(const std::vector<uint8_t> &bits, unsigned frame, unsigned n, const Encoding &e = {}) {
+    unsigned begin = frame * e.slots(), end = std::min(n, begin + e.slots());
     if (begin >= end)
         return false;
     for (unsigned i = begin; i < end; ++i)
@@ -290,17 +290,20 @@ void requireRegular(const std::wstring &path) {
 struct Sender::Impl {
     Handle file;
     Manifest meta;
-    std::array<Packet, ManifestSlots> announcement{};
+    std::vector<Packet> announcement;
     Progress current;
     ProgressCallback report;
     Cancel cancel;
     uint64_t transfer = 0, window = 0;
     unsigned cursor = 0;
-    std::array<uint8_t, WindowFrames / 8> ack{};
+    FrameMask ack{};
     bool announcing = true, finished = false;
     FILETIME originalWrite{};
-    explicit Impl(const std::wstring &path, ProgressCallback cb, Cancel stop)
+    explicit Impl(const std::wstring &path, ProgressCallback cb, Cancel stop, Encoding encoding)
         : report(std::move(cb)), cancel(std::move(stop)) {
+        encoding.validate();
+        meta.encoding = encoding;
+        announcement.resize(encoding.manifestSlots());
         std::wstring full = absolute(path);
         file.reset(CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
@@ -325,10 +328,14 @@ struct Sender::Impl {
         });
         transfer = transferId(meta);
         ManifestWire wire = encodeManifest(meta);
-        for (unsigned i = 0; i < ManifestSlots; ++i) {
+        for (unsigned i = 0; i < meta.encoding.manifestSlots(); ++i) {
             announcement[i].transfer = transfer;
             announcement[i].index = i;
-            std::copy_n(wire.begin() + i * PayloadBytes, PayloadBytes, announcement[i].data.begin());
+            announcement[i].data.assign(meta.encoding.payloadBytes(), 0);
+            size_t offset = size_t(i) * meta.encoding.payloadBytes();
+            std::copy_n(wire.begin() + offset,
+                        std::min<size_t>(meta.encoding.payloadBytes(), wire.size() - offset),
+                        announcement[i].data.begin());
         }
         current.hashing = false;
         current.done = 0;
@@ -348,26 +355,31 @@ struct Sender::Impl {
             throw std::runtime_error("Source file changed during transfer");
     }
     uint64_t acknowledged() const {
-        uint64_t result = std::min(meta.size, window * WindowBytes);
-        unsigned n = inWindow(meta.size, window);
-        for (unsigned f = 0; f < WindowFrames; ++f)
+        uint64_t result = std::min(meta.size, window * meta.encoding.windowBytes());
+        unsigned n = inWindow(meta.size, window, meta.encoding);
+        for (unsigned f = 0; f < meta.encoding.windowFrames; ++f)
             if ((ack[f / 8] >> (f % 8)) & 1) {
-                unsigned begin = f * Slots, end = std::min(n, begin + Slots);
+                unsigned begin = f * meta.encoding.slots(), end = std::min(n, begin + meta.encoding.slots());
                 for (unsigned i = begin; i < end; ++i)
-                    result += bytesFor(meta.size, window * uint64_t(WindowChunks) + i);
+                    result += bytesFor(meta.size, window * uint64_t(meta.encoding.windowChunks()) + i,
+                                       meta.encoding);
             }
         return result;
     }
     WireFrame next(uint32_t sequence) {
         immutable();
         WireFrame frame;
-        frame.info = {transfer, window, sequence, finished};
+        frame.info = {transfer, window, sequence, finished, meta.encoding};
+        frame.packets.resize(meta.encoding.slots());
+        for (auto &packet : frame.packets)
+            packet.data.assign(meta.encoding.payloadBytes(), 0);
         if (announcing || finished || !meta.size) {
-            for (unsigned i = 0; i < Slots; ++i)
-                frame.packets[i] = announcement[i % ManifestSlots];
+            for (unsigned i = 0; i < meta.encoding.slots(); ++i)
+                frame.packets[i] = announcement[i % meta.encoding.manifestSlots()];
             return frame;
         }
-        unsigned n = inWindow(meta.size, window), count = n / Slots + (n % Slots != 0);
+        unsigned n = inWindow(meta.size, window, meta.encoding),
+                 count = n / meta.encoding.slots() + (n % meta.encoding.slots() != 0);
         unsigned chosen = count;
         for (unsigned attempt = 0; attempt < count; ++attempt) {
             unsigned f = cursor++ % count;
@@ -379,26 +391,28 @@ struct Sender::Impl {
         // Once all frame bits are acknowledged, keep announcing while waiting for the
         // receiver's next-window feedback or final verified D command.
         if (chosen == count) {
-            for (unsigned i = 0; i < Slots; ++i)
-                frame.packets[i] = announcement[i % ManifestSlots];
+            for (unsigned i = 0; i < meta.encoding.slots(); ++i)
+                frame.packets[i] = announcement[i % meta.encoding.manifestSlots()];
             return frame;
         }
-        uint64_t first = window * uint64_t(WindowChunks) + chosen * uint64_t(Slots);
+        uint64_t first =
+            window * uint64_t(meta.encoding.windowChunks()) + chosen * uint64_t(meta.encoding.slots());
         size_t amount =
-            size_t(std::min<uint64_t>(Slots * uint64_t(PayloadBytes), meta.size - first * PayloadBytes));
-        std::array<uint8_t, Slots * PayloadBytes> bytes{};
-        readAt(file.value, first * PayloadBytes, bytes.data(), amount);
-        for (unsigned i = 0; i < Slots; ++i) {
+            size_t(std::min<uint64_t>(meta.encoding.slots() * uint64_t(meta.encoding.payloadBytes()),
+                                      meta.size - first * meta.encoding.payloadBytes()));
+        std::vector<uint8_t> bytes(size_t(meta.encoding.slots()) * meta.encoding.payloadBytes(), 0);
+        readAt(file.value, first * meta.encoding.payloadBytes(), bytes.data(), amount);
+        for (unsigned i = 0; i < meta.encoding.slots(); ++i) {
             uint64_t chunk = first + i;
-            if (chunk >= chunks(meta.size)) {
-                frame.packets[i] = announcement[i % ManifestSlots];
+            if (chunk >= chunks(meta.size, meta.encoding)) {
+                frame.packets[i] = announcement[i % meta.encoding.manifestSlots()];
                 continue;
             }
             Packet &p = frame.packets[i];
             p.transfer = transfer;
-            p.index = ManifestSlots + chunk;
-            unsigned len = bytesFor(meta.size, chunk);
-            std::copy_n(bytes.data() + i * PayloadBytes, len, p.data.begin());
+            p.index = meta.encoding.manifestSlots() + chunk;
+            unsigned len = bytesFor(meta.size, chunk, meta.encoding);
+            std::copy_n(bytes.data() + i * meta.encoding.payloadBytes(), len, p.data.begin());
         }
         return frame;
     }
@@ -429,7 +443,7 @@ struct Sender::Impl {
         // An explicit metadata resynchronization can mean a different destination
         // directory with no checkpoint. Its first P is authoritative even when it
         // asks for an earlier window. Outside announce, ignore stale older P lines.
-        if (command.operation != 'P' || command.window >= windows(meta.size) ||
+        if (command.operation != 'P' || command.window >= windows(meta.size, meta.encoding) ||
             (command.window < window && !announcing))
             return;
         if (command.window != window) {
@@ -449,8 +463,8 @@ struct Sender::Impl {
         current.newBytes = 0;
     }
 };
-Sender::Sender(const std::wstring &p, ProgressCallback cb, Cancel cancel)
-    : impl(new Impl(p, std::move(cb), std::move(cancel))) {}
+Sender::Sender(const std::wstring &p, ProgressCallback cb, Cancel cancel, Encoding encoding)
+    : impl(new Impl(p, std::move(cb), std::move(cancel), encoding)) {}
 Sender::~Sender() = default;
 uint64_t Sender::id() const {
     return impl->transfer;
@@ -475,9 +489,9 @@ struct Receiver::Impl {
     std::wstring directory, partPath, statePath, finalName;
     Handle part;
     Manifest meta;
-    std::array<Packet, ManifestSlots> announcement{};
+    std::vector<Packet> announcement;
     unsigned announcementMask = 0;
-    std::array<uint8_t, WindowChunks / 8> received{};
+    std::vector<uint8_t> received = std::vector<uint8_t>(WindowChunks / 8, 0);
     Progress current;
     ProgressCallback report;
     Cancel cancel;
@@ -513,11 +527,12 @@ struct Receiver::Impl {
             report(current);
     }
     uint64_t receivedBytes() const {
-        uint64_t result = std::min(meta.size, window * WindowBytes);
-        unsigned n = inWindow(meta.size, window);
+        uint64_t result = std::min(meta.size, window * meta.encoding.windowBytes());
+        unsigned n = inWindow(meta.size, window, meta.encoding);
         for (unsigned i = 0; i < n; ++i)
             if (bit(received, i))
-                result += bytesFor(meta.size, window * uint64_t(WindowChunks) + i);
+                result +=
+                    bytesFor(meta.size, window * uint64_t(meta.encoding.windowChunks()) + i, meta.encoding);
         return result;
     }
     std::vector<uint8_t> stateBytes() const {
@@ -596,7 +611,7 @@ struct Receiver::Impl {
         uint64_t id = load64(bytes.data() + 16), size = load64(bytes.data() + 24),
                  w = load64(bytes.data() + 64);
         if (status > 2 || id != transfer || size != meta.size ||
-            std::memcmp(bytes.data() + 32, meta.sha.data(), 32) != 0 || w > windows(meta.size))
+            std::memcmp(bytes.data() + 32, meta.sha.data(), 32) != 0 || w > windows(meta.size, meta.encoding))
             throw std::runtime_error("Checkpoint does not match incoming file");
         size_t namesAt = 72 + received.size();
         uint32_t nameLen = load32(bytes.data() + namesAt), finalLen = load32(bytes.data() + namesAt + 4);
@@ -612,11 +627,11 @@ struct Receiver::Impl {
         window = w;
         stateStatus = status;
         std::copy_n(bytes.data() + 72, received.size(), received.begin());
-        unsigned valid = inWindow(meta.size, window);
-        for (unsigned i = valid; i < WindowChunks; ++i)
+        unsigned valid = inWindow(meta.size, window, meta.encoding);
+        for (unsigned i = valid; i < meta.encoding.windowChunks(); ++i)
             if (bit(received, i))
                 throw std::runtime_error("Checkpoint bitmap exceeds file size");
-        if (status && window != windows(meta.size))
+        if (status && window != windows(meta.size, meta.encoding))
             throw std::runtime_error("Completed checkpoint has incomplete windows");
         ownsState = true;
         current.resumed = true;
@@ -720,6 +735,7 @@ struct Receiver::Impl {
         if (incoming.size > uint64_t(std::numeric_limits<LONGLONG>::max()) || transferId(incoming) != id)
             throw std::runtime_error("Invalid file size or transfer identity");
         meta = incoming;
+        received.assign(meta.encoding.windowChunks() / 8, 0);
         transfer = id;
         current.total = meta.size;
         std::wstring stem = stateStem(transfer, meta.filename);
@@ -739,13 +755,15 @@ struct Receiver::Impl {
             fail(resumed ? "Open received temporary file"
                          : "Create received temporary file (existing files are preserved)");
         if (resumed) {
-            uint64_t required = std::min(meta.size, window * WindowBytes);
-            unsigned n = inWindow(meta.size, window);
+            uint64_t required = std::min(meta.size, window * meta.encoding.windowBytes());
+            unsigned n = inWindow(meta.size, window, meta.encoding);
             for (unsigned i = 0; i < n; ++i)
                 if (bit(received, i))
-                    required =
-                        std::max(required, (window * uint64_t(WindowChunks) + i) * PayloadBytes +
-                                               bytesFor(meta.size, window * uint64_t(WindowChunks) + i));
+                    required = std::max(
+                        required,
+                        (window * uint64_t(meta.encoding.windowChunks()) + i) * meta.encoding.payloadBytes() +
+                            bytesFor(meta.size, window * uint64_t(meta.encoding.windowChunks()) + i,
+                                     meta.encoding));
             if (fileSize(part.value) < required || fileSize(part.value) > meta.size)
                 throw std::runtime_error("Temporary file size does not match its checkpoint");
         }
@@ -755,7 +773,7 @@ struct Receiver::Impl {
         dirty = true;
         checkpoint();
         notify();
-        if (window == windows(meta.size))
+        if (window == windows(meta.size, meta.encoding))
             finish();
     }
     void ingest(const DecodedFrame &frame) {
@@ -763,31 +781,46 @@ struct Receiver::Impl {
             cancelled(cancel);
             if (finished)
                 return;
+            frame.info.encoding.validate();
+            if (known && frame.info.encoding != meta.encoding)
+                return;
             uint64_t newBytes = 0;
             for (const Packet &p : frame.packets) {
                 cancelled(cancel);
-                if (p.transfer != frame.info.transfer || (known && p.transfer != transfer))
+                if (p.transfer != frame.info.transfer || (known && p.transfer != transfer) ||
+                    p.data.size() != frame.info.encoding.payloadBytes())
                     continue;
-                if (p.index < ManifestSlots) {
+                if (p.index < frame.info.encoding.manifestSlots()) {
                     if (known)
                         continue;
-                    if (!candidateKnown || candidate != p.transfer) {
+                    if (!candidateKnown || candidate != p.transfer || meta.encoding != frame.info.encoding) {
                         candidate = p.transfer;
+                        meta.encoding = frame.info.encoding;
+                        announcement.assign(meta.encoding.manifestSlots(), Packet{});
                         candidateKnown = true;
                         announcementMask = 0;
                     }
                     announcement[size_t(p.index)] = p;
                     announcementMask |= 1u << unsigned(p.index);
-                    if (announcementMask == (1u << ManifestSlots) - 1) {
+                    if (announcementMask == (1u << meta.encoding.manifestSlots()) - 1) {
                         Manifest decoded;
                         try {
                             ManifestWire wire{};
-                            for (unsigned i = 0; i < ManifestSlots; ++i)
-                                std::copy(announcement[i].data.begin(), announcement[i].data.end(),
-                                          wire.begin() + i * PayloadBytes);
+                            for (unsigned i = 0; i < meta.encoding.manifestSlots(); ++i)
+                                std::copy_n(
+                                    announcement[i].data.begin(),
+                                    std::min<size_t>(meta.encoding.payloadBytes(),
+                                                     wire.size() - size_t(i) * meta.encoding.payloadBytes()),
+                                    wire.begin() + size_t(i) * meta.encoding.payloadBytes());
+                            const auto &last = announcement.back().data;
+                            size_t used =
+                                wire.size() - (announcement.size() - 1) * meta.encoding.payloadBytes();
+                            if (!std::all_of(last.begin() + used, last.end(),
+                                             [](uint8_t n) { return n == 0; }))
+                                throw std::runtime_error("Nonzero metadata packet padding");
                             decoded = decodeManifest(wire);
                             safeName(decoded.filename);
-                            if (transferId(decoded) != candidate ||
+                            if (decoded.encoding != frame.info.encoding || transferId(decoded) != candidate ||
                                 decoded.size > uint64_t(std::numeric_limits<LONGLONG>::max()))
                                 throw std::runtime_error("Invalid manifest identity or size");
                         } catch (const std::exception &) {
@@ -804,14 +837,15 @@ struct Receiver::Impl {
                 }
                 if (!known || frame.info.window != window)
                     continue;
-                uint64_t chunk = p.index - ManifestSlots;
-                if (chunk >= chunks(meta.size) || chunk / WindowChunks != window)
+                uint64_t chunk = p.index - meta.encoding.manifestSlots();
+                if (chunk >= chunks(meta.size, meta.encoding) ||
+                    chunk / meta.encoding.windowChunks() != window)
                     continue;
-                unsigned local = unsigned(chunk % WindowChunks);
+                unsigned local = unsigned(chunk % meta.encoding.windowChunks());
                 if (bit(received, local))
                     continue;
-                unsigned len = bytesFor(meta.size, chunk);
-                writeAt(part.value, chunk * PayloadBytes, p.data.data(), len);
+                unsigned len = bytesFor(meta.size, chunk, meta.encoding);
+                writeAt(part.value, chunk * meta.encoding.payloadBytes(), p.data.data(), len);
                 setBit(received, local);
                 dirty = true;
                 newBytes += len;
@@ -823,7 +857,7 @@ struct Receiver::Impl {
             current.message = L"Receiving file";
             notify();
             current.newBytes = 0;
-            unsigned n = inWindow(meta.size, window);
+            unsigned n = inWindow(meta.size, window, meta.encoding);
             bool all = true;
             for (unsigned i = 0; i < n; ++i)
                 if (!bit(received, i)) {
@@ -833,11 +867,11 @@ struct Receiver::Impl {
             if (all) {
                 // Commit bytes and completed prefix as one durable checkpoint.
                 ++window;
-                received.fill(0);
+                std::fill(received.begin(), received.end(), 0);
                 dirty = true;
                 current.done = receivedBytes();
                 checkpoint();
-                if (window == windows(meta.size))
+                if (window == windows(meta.size, meta.encoding))
                     finish();
                 else {
                     current.message = L"Window saved; requesting next window";
@@ -866,9 +900,9 @@ struct Receiver::Impl {
             return out;
         }
         out.operation = 'P';
-        unsigned n = inWindow(meta.size, window);
-        for (unsigned f = 0; f < WindowFrames; ++f)
-            if (frameDone(received, f, n))
+        unsigned n = inWindow(meta.size, window, meta.encoding);
+        for (unsigned f = 0; f < meta.encoding.windowFrames; ++f)
+            if (frameDone(received, f, n, meta.encoding))
                 out.mask[f / 8] |= uint8_t(1u << (f % 8));
         return out;
     }

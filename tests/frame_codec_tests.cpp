@@ -221,7 +221,7 @@ void frameCodecSelfTest() {
     for (unsigned i = 0; i < 9 && sparseOk; ++i)
         sparseOk = samePacket(sparseResult.frame.packets[i], sparse.packets[i]);
     check(sparseOk, "partial real packets plus zero padding", passed);
-    sparse.packets = {};
+    sparse.packets.assign(Slots, Packet{});
     auto empty = codec.decode(codec.encode(sparse));
     check(empty.valid && empty.frame.packets.empty() && empty.status == "payload_failed",
           "zero valid payload preserves header and canvas", passed);

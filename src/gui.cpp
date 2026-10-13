@@ -14,6 +14,10 @@
 #include "frame_codec.h"
 #include "windows_channel.h"
 #include "protocol.h"
+#include "image_runtime.h"
+#include "diagnostics.h"
+#include "settings.h"
+#include "advanced_settings.h"
 #include <algorithm>
 #include <chrono>
 #include <atomic>
@@ -23,6 +27,7 @@
 #include <thread>
 #include <memory>
 #include <stdexcept>
+#include <typeinfo>
 #include <vector>
 
 namespace {
@@ -41,7 +46,10 @@ enum Control {
     ProgressBar,
     StatusLabel,
     DetailLabel,
-    LogEdit
+    LogEdit,
+    AdvancedButton,
+    CopyFeedbackButton,
+    EncodingLabel
 };
 struct Ticket {
     HWND target = nullptr;
@@ -53,7 +61,7 @@ struct Ticket {
 struct Update {
     cst::Progress progress;
     std::wstring note;
-    bool hasProgress = true, error = false;
+    bool hasProgress = true, error = false, status = true;
 };
 struct Application {
     HWND window = nullptr, log = nullptr;
@@ -62,7 +70,13 @@ struct Application {
     std::thread worker;
     std::mutex ticketMutex;
     Ticket ticket;
-    bool running = false, closing = false, smoke = false, autoReceive = false, lastRoleSend = false;
+    bool running = false, closing = false, smoke = false, senderSmoke = false, autoReceive = false,
+         lastRoleSend = false;
+    bool smokeFault = false;
+    bool initializing = true, settingsSmoke = false, processOverride = false;
+    cst::Settings settings;
+    std::wstring settingsPath, settingsWarning;
+    std::atomic<unsigned> smokeFrames{0};
     int smokeResult = 1;
     std::wstring source, directory, process = L"uSmartView_VDI_Client.exe", lastMessage, completedPath,
                                     lastError;
@@ -86,6 +100,19 @@ std::wstring widen(const std::string &text) {
     if (n)
         MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), out.data(), n);
     return out;
+}
+std::wstring describeFailure(std::exception_ptr failure, bool &wasCancelled) {
+    wasCancelled = false;
+    try {
+        std::rethrow_exception(failure);
+    } catch (const std::exception &error) {
+        wasCancelled = std::string(error.what()) == "Transfer cancelled";
+        cst::diagnostics::exception(typeid(error).name(), error.what());
+        return widen(error.what());
+    } catch (...) {
+        cst::diagnostics::exception("non-standard C++ exception", "no std::exception message");
+        return L"非标准C++异常；详情已记录到CloudScreenTransfer.log";
+    }
 }
 std::wstring bytes(uint64_t count) {
     const wchar_t *units[] = {L"B", L"KiB", L"MiB", L"GiB", L"TiB", L"PiB"};
@@ -116,19 +143,63 @@ void post(const cst::Progress &progress, std::wstring note = {}) {
     if (PostMessageW(app.window, UpdateMessage, 0, reinterpret_cast<LPARAM>(value.get())))
         value.release();
 }
-void postNote(std::wstring note, bool error = false) {
+void postNote(std::wstring note, bool error = false, bool status = true) {
     auto value = std::make_unique<Update>();
     value->note = std::move(note);
     value->hasProgress = false;
     value->error = error;
+    value->status = status;
     if (PostMessageW(app.window, UpdateMessage, 0, reinterpret_cast<LPARAM>(value.get())))
         value.release();
 }
 void enabled() {
-    for (int id : {SendRole, ReceiveRole, PathEdit, BrowseButton, StartButton, ProcessEdit})
+    for (int id : {SendRole, ReceiveRole, PathEdit, BrowseButton, StartButton, ProcessEdit, AdvancedButton})
         EnableWindow(item(id), !app.running);
     EnableWindow(item(ProcessEdit), !app.running && !sender());
     EnableWindow(item(StopButton), app.running);
+    EnableWindow(item(CopyFeedbackButton), app.running && !sender());
+}
+void refreshEncodingLabel() {
+    const auto &s = app.settings;
+    const auto &e = s.encoding;
+    std::wostringstream label;
+    label << e.width << L"×" << e.height << L" · " << e.cell << L"px / " << e.levels << L"灰 · " << s.sendFps
+          << L" FPS · ECC" << e.parity << L"　｜　接收 " << s.captureFps << L" FPS";
+    SetWindowTextW(item(EncodingLabel), label.str().c_str());
+}
+void captureMainOptions() {
+    bool send = sender();
+    if (send)
+        app.source = textOf(item(PathEdit));
+    else
+        app.directory = textOf(item(PathEdit));
+    app.process = textOf(item(ProcessEdit));
+    app.settings.send = send;
+    app.settings.source = app.source;
+    app.settings.directory = app.directory;
+    app.settings.process = app.process;
+    WINDOWPLACEMENT position{sizeof(position)};
+    if (GetWindowPlacement(app.window, &position)) {
+        const auto &r = position.rcNormalPosition;
+        app.settings.windowSaved = true;
+        app.settings.windowX = r.left;
+        app.settings.windowY = r.top;
+        app.settings.windowWidth = std::max(900, int(r.right - r.left));
+        app.settings.windowHeight = std::max(650, int(r.bottom - r.top));
+    }
+}
+bool persistOptions() {
+    if (app.smoke || app.initializing)
+        return false;
+    try {
+        captureMainOptions();
+        cst::saveSettings(app.settingsPath, app.settings);
+        return true;
+    } catch (...) {
+        bool ignored = false;
+        log(L"设置保存失败：" + describeFailure(std::current_exception(), ignored));
+    }
+    return false;
 }
 void role() {
     if (app.running)
@@ -145,6 +216,8 @@ void role() {
     SetWindowTextW(item(PathEdit), (send ? app.source : app.directory).c_str());
     SetWindowTextW(item(BrowseButton), send ? L"选择文件…" : L"选择目录…");
     enabled();
+    if (!app.initializing)
+        SetTimer(app.window, 1, 500, nullptr);
 }
 std::wstring quote(const std::wstring &argument) {
     std::wstring out = L"\"";
@@ -183,7 +256,8 @@ bool elevateReceiver(const std::wstring &directory, const std::wstring &process)
     if (!n || n >= executable.size())
         throw std::runtime_error("Cannot locate executable");
     executable.resize(n);
-    auto parameters = L"--receive " + quote(directory) + L" --process " + quote(process);
+    auto parameters = L"--receive " + quote(directory) + L" --process " + quote(process) + L" --config " +
+                      quote(app.settingsPath);
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.lpVerb = L"runas";
@@ -225,11 +299,46 @@ void browse() {
         }
     }
 }
+void copyFeedback() {
+    Ticket ticket;
+    {
+        std::lock_guard<std::mutex> lock(app.ticketMutex);
+        ticket = app.ticket;
+    }
+    if (!ticket.valid || !ticket.feedback.transfer) {
+        log(L"尚未识别有效图像，请稍后再复制回执。");
+        return;
+    }
+    auto wire = widen(cst::formatFeedback(ticket.feedback));
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (wire.size() + 1) * sizeof(wchar_t));
+    if (!memory)
+        throw std::runtime_error("Cannot allocate feedback clipboard");
+    auto *data = static_cast<wchar_t *>(GlobalLock(memory));
+    if (!data) {
+        GlobalFree(memory);
+        throw std::runtime_error("Cannot lock feedback clipboard");
+    }
+    std::copy(wire.begin(), wire.end(), data);
+    data[wire.size()] = L'\0';
+    GlobalUnlock(memory);
+    if (!OpenClipboard(app.window)) {
+        GlobalFree(memory);
+        throw std::runtime_error("Cannot open clipboard");
+    }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+        CloseClipboard();
+        GlobalFree(memory);
+        throw std::runtime_error("Cannot copy feedback");
+    }
+    CloseClipboard();
+    log(L"回执已复制。在云端数据画布中按 Ctrl+V 可手动返回。");
+}
 bool ticketFresh(const Ticket &ticket) {
     std::lock_guard<std::mutex> lock(app.ticketMutex);
     return !app.stopped && app.ticket.valid && app.ticket.target == ticket.target &&
            app.ticket.canvas == ticket.canvas && app.ticket.feedback.transfer == ticket.feedback.transfer &&
-           Clock::now() - app.ticket.seen < std::chrono::milliseconds(900);
+           Clock::now() - app.ticket.seen < std::chrono::milliseconds(app.settings.imageFreshMs);
 }
 cst::Feedback feedbackForFrame(cst::Feedback command, const cst::FrameInfo &frame) {
     if (command.operation == 'M' && !command.transfer)
@@ -237,28 +346,39 @@ cst::Feedback feedbackForFrame(cst::Feedback command, const cst::FrameInfo &fram
     return command;
 }
 void feedbackLoop() {
+    cst::diagnostics::stage("keyboard_feedback");
     Clock::time_point last{};
-    std::string previous;
+    std::wstring previousFailure;
+    cst::Feedback lastCommand;
     while (!app.stopped) {
         Ticket current;
         {
             std::lock_guard<std::mutex> lock(app.ticketMutex);
             current = app.ticket;
         }
-        if (current.valid && current.feedback.transfer &&
-            Clock::now() - current.seen < std::chrono::milliseconds(900)) {
+        if (app.settings.feedbackEnabled && current.valid && current.feedback.transfer &&
+            Clock::now() - current.seen < std::chrono::milliseconds(app.settings.imageFreshMs)) {
             auto wire = cst::formatFeedback(current.feedback);
-            auto interval =
-                current.feedback.operation == 'P' ? std::chrono::seconds(4) : std::chrono::seconds(1);
-            if (wire != previous || Clock::now() - last >= interval) {
+            auto interval = std::chrono::milliseconds(
+                current.feedback.operation == 'P' ? app.settings.progressAckMs : app.settings.controlAckMs);
+            bool phaseChanged = current.feedback.operation != lastCommand.operation ||
+                                current.feedback.transfer != lastCommand.transfer ||
+                                current.feedback.window != lastCommand.window;
+            if (phaseChanged || Clock::now() - last >= interval) {
                 std::wstring failure;
                 bool sent = cst::sendFeedback(
-                    current.target, current.canvas, wire, [&] { return !ticketFresh(current); }, failure);
+                    current.target, current.canvas, wire, [&] { return !ticketFresh(current); }, failure,
+                    app.settings);
                 last = Clock::now();
-                if (sent)
-                    previous = wire;
-                else if (!app.stopped)
-                    postNote(L"回执等待：" + failure);
+                lastCommand = current.feedback;
+                if (sent) {
+                    if (!previousFailure.empty())
+                        postNote(L"回执已恢复。", false, false);
+                    previousFailure.clear();
+                } else if (!app.stopped && failure != previousFailure) {
+                    postNote(L"回执暂缓（画面接收继续）：" + failure, false, false);
+                    previousFailure = failure;
+                }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -266,6 +386,7 @@ void feedbackLoop() {
 }
 void work(bool send, std::wstring path, std::wstring process) {
     bool success = false, failed = false;
+    std::atomic<bool> feedbackFailed{false};
     std::thread feedback;
     auto last = Clock::time_point{};
     bool lastHash = false;
@@ -286,20 +407,32 @@ void work(bool send, std::wstring path, std::wstring process) {
                 lastHash = p.hashing;
             }
         };
+        cst::diagnostics::stage("prepare_image_codec");
         cst::FrameCodec codec;
         if (send) {
-            cst::Sender source(path, progress, [] { return app.stopped.load(); });
-            cst::Canvas canvas([&](const cst::Feedback &f) { source.feedback(f); });
+            cst::diagnostics::stage("open_and_hash_source");
+            cst::Sender source(path, progress, [] { return app.stopped.load(); }, app.settings.encoding);
+            cst::diagnostics::stage("create_sender_canvas");
+            cst::Canvas canvas([&](const cst::Feedback &f) { source.feedback(f); }, !app.smoke,
+                               app.settings.encoding);
             uint32_t sequence = 0;
             auto next = Clock::now();
             Clock::time_point done{};
             while (!app.stopped && canvas.poll()) {
                 auto now = Clock::now();
                 if (now >= next) {
-                    canvas.display(codec.encode(source.next(sequence++)));
+                    cst::diagnostics::stage("encode_frame");
+                    auto frame = codec.encode(source.next(sequence++));
+                    cst::diagnostics::stage("render_frame");
+                    if (app.senderSmoke && app.smokeFault && app.smokeFrames == 1)
+                        throw 7; // Exercise a non-std exception after a canvas has already rendered.
+                    canvas.display(frame);
+                    if (app.senderSmoke && ++app.smokeFrames >= 3) {
+                        app.stopped = true;
+                        break;
+                    }
                     progress(source.progress());
-                    next = now +
-                           std::chrono::milliseconds(200); // Encode/render belongs inside the 200ms period.
+                    next = now + std::chrono::nanoseconds(1000000000 / app.settings.sendFps);
                     if (source.complete()) {
                         if (done == Clock::time_point{})
                             done = now;
@@ -309,16 +442,27 @@ void work(bool send, std::wstring path, std::wstring process) {
                         }
                     }
                 }
+                cst::diagnostics::stage("sender_wait");
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             if (source.complete())
                 success = true;
         } else {
+            cst::diagnostics::stage("prepare_receiver");
             receiverForSave =
                 std::make_unique<cst::Receiver>(path, progress, [] { return app.stopped.load(); });
             auto &receiver = *receiverForSave;
             cst::Capture capture;
-            feedback = std::thread(feedbackLoop);
+            feedback = std::thread([&] {
+                try {
+                    feedbackLoop();
+                } catch (...) {
+                    feedbackFailed = true;
+                    app.stopped = true;
+                    bool cancelled = false;
+                    postNote(L"回执失败：" + describeFailure(std::current_exception(), cancelled), true);
+                }
+            });
             HWND client = nullptr;
             auto report = Clock::now();
             Clock::time_point done{};
@@ -326,10 +470,13 @@ void work(bool send, std::wstring path, std::wstring process) {
                 auto tick = Clock::now();
                 if (!client || !IsWindow(client) || !IsWindowVisible(client) || IsIconic(client))
                     client = cst::findClient(process);
+                cst::diagnostics::stage("capture_screen");
                 auto image = capture.take(client);
+                cst::diagnostics::stage("decode_frame");
                 auto decoded = image.empty() ? cst::DecodeResult{} : codec.decode(image);
                 auto observed = Clock::now();
                 if (decoded.valid) {
+                    cst::diagnostics::stage("receive_file_data");
                     receiver.ingest(decoded.frame);
                     auto command = feedbackForFrame(receiver.feedback(), decoded.frame.info);
                     // A restarting receiver can request metadata from a CRC-verified data header.
@@ -366,41 +513,58 @@ void work(bool send, std::wstring path, std::wstring process) {
                     success = true;
                     break;
                 }
-                std::this_thread::sleep_until(tick + std::chrono::milliseconds(50));
+                std::this_thread::sleep_until(tick +
+                                              std::chrono::nanoseconds(1000000000 / app.settings.captureFps));
             }
+            cst::diagnostics::stage("save_progress");
             receiver.save();
             if (receiver.complete())
                 success = true;
         }
-    } catch (const std::exception &error) {
+    } catch (...) {
+        const char *failedStage = cst::diagnostics::stage();
+        bool wasCancelled = false;
+        auto error = describeFailure(std::current_exception(), wasCancelled);
         // Keep the receiver alive through cancellation so saving errors reach the UI.
         std::wstring saveFailure;
         try {
-            if (receiverForSave)
+            if (receiverForSave) {
+                cst::diagnostics::stage("save_progress_after_failure");
                 receiverForSave->save();
-        } catch (const std::exception &saving) {
+            }
+        } catch (...) {
             failed = true;
-            saveFailure = L"；保存进度失败：" + widen(saving.what());
+            bool ignored = false;
+            saveFailure = L"；保存进度失败：" + describeFailure(std::current_exception(), ignored);
         }
-        if (!app.stopped || std::string(error.what()) != "Transfer cancelled") {
+        if (!app.stopped || !wasCancelled) {
             failed = true;
-            postNote(L"任务失败：" + widen(error.what()) + saveFailure, true);
+            postNote(L"任务失败（" + widen(failedStage) + L"）：" + error + saveFailure, true);
         } else if (!saveFailure.empty())
             postNote(L"停止时" + saveFailure, true);
     }
+    cst::diagnostics::stage("worker_cleanup");
     app.stopped = true;
     if (feedback.joinable())
         feedback.join();
+    failed = failed || feedbackFailed;
     receiverForSave.reset();
     {
         std::lock_guard<std::mutex> lock(app.ticketMutex);
         app.ticket.valid = false;
     }
     PostMessageW(app.window, FinishMessage, failed ? 2 : success ? 0 : 1, 0);
+    cst::diagnostics::append(failed    ? "worker_finished result=failed\r\n"
+                             : success ? "worker_finished result=complete\r\n"
+                                       : "worker_finished result=stopped\r\n");
 }
 void start() {
     if (app.running)
         return;
+    // A stopped/failed job must be joined before assigning another std::thread.
+    if (app.worker.joinable())
+        app.worker.join();
+    persistOptions();
     bool send = sender();
     auto path = textOf(item(PathEdit)), process = textOf(item(ProcessEdit));
     if (path.empty() || (!send && process.empty())) {
@@ -426,19 +590,25 @@ void start() {
     app.lastMessage.clear();
     app.lastError.clear();
     app.completedPath.clear();
+    app.smokeFrames = 0;
     app.started = Clock::now();
     enabled();
     SendMessageW(item(ProgressBar), PBM_SETPOS, 0, 0);
     SetWindowTextW(item(DetailLabel), L"准备文件传输…");
     SetWindowTextW(item(StatusLabel), send ? L"正在检查源文件…" : L"等待发送端图像…");
     log(send ? L"发送开始：" + path : L"接收开始：" + path);
+    cst::diagnostics::stage("launch_worker");
+    cst::diagnostics::append(send ? "sender_start\r\n" : "receiver_start\r\n");
     try {
         app.worker = std::thread(work, send, std::move(path), std::move(process));
-    } catch (const std::exception &error) {
+    } catch (...) {
         app.running = false;
         app.stopped = true;
         enabled();
-        log(L"无法开始任务：" + widen(error.what()));
+        bool ignored = false;
+        app.lastError = L"无法开始任务：" + describeFailure(std::current_exception(), ignored);
+        SetWindowTextW(item(StatusLabel), app.lastError.c_str());
+        log(app.lastError);
     }
 }
 HWND control(const wchar_t *klass, const wchar_t *text, DWORD style, int id, int x, int y, int w, int h) {
@@ -456,11 +626,12 @@ void controls() {
                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
     HWND title = control(L"STATIC", L"CloudScreenTransfer 图像文件传输", 0, 0, 24, 20, 810, 36);
     SendMessageW(title, WM_SETFONT, reinterpret_cast<WPARAM>(app.heading), TRUE);
-    control(L"STATIC", L"2px四灰 · 5 FPS · ECC48　｜　缺块重传 · 中断续传 · SHA-256校验", 0, 0, 24, 64, 800,
-            26);
+    control(L"STATIC", L"", 0, EncodingLabel, 24, 64, 800, 26);
     control(L"BUTTON", L"云桌面发送", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, SendRole, 24, 108, 190, 30);
     control(L"BUTTON", L"物理机接收", BS_AUTORADIOBUTTON | WS_TABSTOP, ReceiveRole, 240, 108, 190, 30);
-    SendMessageW(item(ReceiveRole), BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(item(ReceiveRole), BM_SETCHECK, app.settings.send ? BST_UNCHECKED : BST_CHECKED, 0);
+    SendMessageW(item(SendRole), BM_SETCHECK, app.settings.send ? BST_CHECKED : BST_UNCHECKED, 0);
+    app.lastRoleSend = app.settings.send;
     control(L"STATIC", L"保存目录", 0, PathLabel, 24, 160, 90, 26);
     control(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, PathEdit, 122, 153, 560, 32);
     control(L"BUTTON", L"选择目录…", BS_PUSHBUTTON | WS_TABSTOP, BrowseButton, 696, 152, 150, 34);
@@ -469,7 +640,9 @@ void controls() {
     control(L"STATIC", L"发送端无需设置", 0, 0, 696, 210, 150, 26);
     control(L"BUTTON", L"开始", BS_DEFPUSHBUTTON | WS_TABSTOP, StartButton, 24, 254, 135, 38);
     control(L"BUTTON", L"停止并保存进度", BS_PUSHBUTTON | WS_TABSTOP, StopButton, 179, 254, 180, 38);
-    control(L"BUTTON", L"打开保存目录", BS_PUSHBUTTON | WS_TABSTOP, FolderButton, 379, 254, 180, 38);
+    control(L"BUTTON", L"打开保存目录", BS_PUSHBUTTON | WS_TABSTOP, FolderButton, 379, 254, 155, 38);
+    control(L"BUTTON", L"高级设置…", BS_PUSHBUTTON | WS_TABSTOP, AdvancedButton, 554, 254, 126, 38);
+    control(L"BUTTON", L"复制回执", BS_PUSHBUTTON | WS_TABSTOP, CopyFeedbackButton, 700, 254, 146, 38);
     control(L"STATIC", L"先开始物理机接收，再选择云端文件发送。", 0, StatusLabel, 24, 322, 820, 30);
     control(PROGRESS_CLASSW, L"", 0, ProgressBar, 24, 367, 822, 22);
     SendMessageW(item(ProgressBar), PBM_SETRANGE32, 0, 1000);
@@ -480,6 +653,7 @@ void controls() {
                       LogEdit, 24, 492, 822, 160);
     SendMessageW(app.log, EM_SETLIMITTEXT, 300000, 0);
     role();
+    refreshEncodingLabel();
     log(L"文件先写入临时文件；仅SHA-"
         L"256通过后显示完成并生成最终文件。接收开始时自动请求管理员权限。离开云桌面前台会暂停回执。 ");
 }
@@ -520,6 +694,16 @@ LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO:
         reinterpret_cast<MINMAXINFO *>(lp)->ptMinTrackSize = {900, 650};
         return 0;
+    case WM_MOVE:
+        if (!app.initializing)
+            SetTimer(window, 1, 500, nullptr);
+        return 0;
+    case WM_TIMER:
+        if (wp == 1) {
+            KillTimer(window, 1);
+            persistOptions();
+        }
+        return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == StartButton)
             start();
@@ -536,8 +720,30 @@ LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (reinterpret_cast<INT_PTR>(
                     ShellExecuteW(window, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
                 log(L"保存目录尚未创建或无法打开。");
+        } else if (LOWORD(wp) == AdvancedButton && !app.running) {
+            try {
+                captureMainOptions();
+                if (cst::editAdvancedSettings(window, app.font, app.settings)) {
+                    refreshEncodingLabel();
+                    if (persistOptions())
+                        log(L"高级设置已保存，下次启动会恢复这些参数。");
+                }
+            } catch (...) {
+                bool ignored = false;
+                log(L"设置失败：" + describeFailure(std::current_exception(), ignored));
+            }
+        } else if (LOWORD(wp) == CopyFeedbackButton) {
+            try {
+                copyFeedback();
+            } catch (...) {
+                bool ignored = false;
+                log(L"复制失败：" + describeFailure(std::current_exception(), ignored));
+            }
         } else if ((LOWORD(wp) == SendRole || LOWORD(wp) == ReceiveRole) && HIWORD(wp) == BN_CLICKED)
             role();
+        else if ((LOWORD(wp) == PathEdit || LOWORD(wp) == ProcessEdit) && HIWORD(wp) == EN_CHANGE &&
+                 !app.initializing)
+            SetTimer(window, 1, 500, nullptr);
         return 0;
     case UpdateMessage: {
         std::unique_ptr<Update> u(reinterpret_cast<Update *>(lp));
@@ -562,7 +768,8 @@ LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (!u->note.empty()) {
             if (u->error)
                 app.lastError = u->note;
-            SetWindowTextW(item(StatusLabel), u->note.c_str());
+            if (u->status)
+                SetWindowTextW(item(StatusLabel), u->note.c_str());
             if (u->note != app.lastMessage) {
                 log(u->note);
                 app.lastMessage = u->note;
@@ -600,6 +807,7 @@ LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             DestroyWindow(window);
         return 0;
     case WM_CLOSE:
+        persistOptions();
         if (app.running) {
             app.closing = true;
             app.stopped = true;
@@ -628,24 +836,100 @@ bool smoke() {
     update->progress.newBytes = 400;
     SendMessageW(app.window, UpdateMessage, 0, reinterpret_cast<LPARAM>(update));
     auto detail = textOf(item(DetailLabel));
+    auto beforeNote = textOf(item(StatusLabel));
     auto note = new Update;
     note->hasProgress = false;
+    note->status = false;
     note->note = L"回执等待";
     SendMessageW(app.window, UpdateMessage, 0, reinterpret_cast<LPARAM>(note));
     valid = valid && SendMessageW(item(ProgressBar), PBM_GETPOS, 0, 0) == 400 &&
-            textOf(item(DetailLabel)) == detail;
+            textOf(item(DetailLabel)) == detail && textOf(item(StatusLabel)) == beforeNote;
     SendMessageW(item(ReceiveRole), BM_SETCHECK, BST_UNCHECKED, 0);
     SendMessageW(item(SendRole), BM_SETCHECK, BST_CHECKED, 0);
     role();
-    return valid && sender() && !IsWindowEnabled(item(ProcessEdit));
+    return valid && sender() && !IsWindowEnabled(item(ProcessEdit)) &&
+           IsWindowEnabled(item(AdvancedButton)) && cst::advancedSettingsSmoke(app.window, app.font);
+}
+bool senderSmoke() {
+    // Run the actual GUI Start -> worker -> image -> Finish lifecycle. The
+    // regular controls smoke test never started a sender or displayed a frame.
+    wchar_t temporary[MAX_PATH]{}, source[MAX_PATH]{};
+    DWORD n = GetTempPathW(MAX_PATH, temporary);
+    if (!n || n >= MAX_PATH || !GetTempFileNameW(temporary, L"cst", 0, source))
+        throw std::runtime_error("Cannot create sender smoke fixture");
+    struct Cleanup {
+        const wchar_t *path;
+        ~Cleanup() {
+            app.stopped = true;
+            if (app.worker.joinable())
+                app.worker.join();
+            app.running = false;
+            DeleteFileW(path);
+        }
+    } cleanup{source};
+    SendMessageW(item(ReceiveRole), BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(item(SendRole), BM_SETCHECK, BST_CHECKED, 0);
+    role();
+    DWORD initialGdi = 0, initialUser = 0;
+    for (unsigned run = 0; run < 7; ++run) {
+        HANDLE file =
+            CreateFileW(source, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("Cannot open sender smoke fixture");
+        std::vector<uint8_t> payload(run == 3 ? 0 : run == 4 ? 1 : 512 * 1024);
+        for (size_t i = 0; i < payload.size(); ++i)
+            payload[i] = uint8_t(i * 31 + run);
+        DWORD written = 0;
+        BOOL ok =
+            payload.empty() || WriteFile(file, payload.data(), DWORD(payload.size()), &written, nullptr);
+        CloseHandle(file);
+        if (!ok || written != payload.size())
+            throw std::runtime_error("Cannot write sender smoke fixture");
+        auto path = std::wstring(source) + (run < 2 ? L".missing" : L"");
+        SetWindowTextW(item(PathEdit), path.c_str());
+        app.smokeFault = run == 2;
+        SendMessageW(app.window, WM_COMMAND, StartButton, 0);
+        if (!app.running)
+            throw std::runtime_error("Sender smoke did not launch a worker");
+        SendMessageW(app.window, WM_COMMAND, StartButton, 0); // Ignore a double click while running.
+        auto deadline = Clock::now() + std::chrono::seconds(15);
+        while (app.running && Clock::now() < deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            Sleep(1);
+        }
+        bool failed = run < 3;
+        if (app.running || app.worker.joinable() || !IsWindowEnabled(item(StartButton)) ||
+            IsWindowEnabled(item(StopButton)) || app.lastError.empty() == failed ||
+            app.smokeFrames != (run < 2    ? 0u
+                                : run == 2 ? 1u
+                                           : 3u))
+            throw std::runtime_error("Sender failure/stop did not restore a restartable GUI");
+        if (run == 2 && app.lastError.find(L"render_frame") == std::wstring::npos)
+            throw std::runtime_error("Non-standard sender exception lost the failing stage");
+        if (run == 3) {
+            initialGdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            initialUser = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+        } else if (run > 3 && (GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) > initialGdi ||
+                               GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) > initialUser))
+            throw std::runtime_error("Repeated sender starts leaked GDI or window resources");
+    }
+    return true;
 }
 } // namespace
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    cst::diagnostics::install();
     SetProcessDPIAware();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX common{sizeof(common), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&common);
     try {
+        cst::diagnostics::stage("configure_opencv");
+        cst::initializeImageRuntime(); // Before any OpenCV work or transfer thread.
+        cst::diagnostics::append("image_runtime threads=1 gdi_conversion=sequential\r\n");
         wchar_t desktop[MAX_PATH]{};
         if (SUCCEEDED(
                 SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, SHGFP_TYPE_CURRENT, desktop)))
@@ -660,11 +944,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                     std::wstring option = args[i];
                     if (option == L"--smoke-test")
                         app.smoke = true;
-                    else if (option == L"--receive" && i + 1 < count) {
+                    else if (option == L"--sender-smoke-test") {
+                        app.smoke = true;
+                        app.senderSmoke = true;
+                    } else if (option == L"--settings-smoke-test") {
+                        app.smoke = true;
+                        app.settingsSmoke = true;
+                    } else if (option == L"--receive" && i + 1 < count) {
                         app.autoReceive = true;
                         app.directory = args[++i];
-                    } else if (option == L"--process" && i + 1 < count)
+                    } else if (option == L"--process" && i + 1 < count) {
                         app.process = args[++i];
+                        app.processOverride = true;
+                    } else if (option == L"--config" && i + 1 < count)
+                        app.settingsPath = args[++i];
                     else
                         throw std::runtime_error("Unknown startup option");
                 }
@@ -673,6 +966,45 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 throw;
             }
             LocalFree(args);
+        }
+        struct FixtureCleanup {
+            std::wstring path;
+            ~FixtureCleanup() {
+                if (!path.empty())
+                    DeleteFileW(path.c_str());
+            }
+        } fixture;
+        if (app.settingsSmoke) {
+            wchar_t folder[32768]{};
+            DWORD n = GetCurrentDirectoryW(DWORD(std::size(folder)), folder);
+            if (!n || n >= std::size(folder))
+                throw std::runtime_error("Cannot create settings smoke fixture");
+            fixture.path = std::wstring(folder) + L"\\cst-gui-settings-" +
+                           std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+                           L".ini";
+            cst::Settings s;
+            s.send = true;
+            s.source = L"C:\\fixtures\\中文文件.bin";
+            s.directory = L"C:\\fixtures\\接收目录";
+            s.process = L"SavedVDI.exe";
+            s.encoding = {900, 500, 3, 8, 64, 64};
+            s.sendFps = 8;
+            s.captureFps = 30;
+            s.restoreMouse = true;
+            cst::saveSettings(fixture.path, s);
+            app.settingsPath = fixture.path;
+        }
+        if (!app.smoke || app.settingsSmoke) {
+            if (app.settingsPath.empty())
+                app.settingsPath = cst::defaultSettingsPath();
+            app.settings = cst::loadSettings(app.settingsPath, app.settingsWarning);
+            app.source = app.settings.source;
+            if (!app.autoReceive && !app.settings.directory.empty())
+                app.directory = app.settings.directory;
+            if (!app.processOverride)
+                app.process = app.settings.process;
+            if (app.autoReceive)
+                app.settings.send = false;
         }
         WNDCLASSW cls{};
         cls.lpfnWndProc = procedure;
@@ -687,12 +1019,38 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         int height = std::min(680, std::max(650, int(workArea.bottom - workArea.top)));
         int x = workArea.left + std::max(0, (int(workArea.right - workArea.left) - 900) / 2);
         int y = workArea.top + std::max(0, (int(workArea.bottom - workArea.top) - height) / 2);
-        HWND window = CreateWindowW(cls.lpszClassName, L"CloudScreenTransfer 0.1.0", WS_OVERLAPPEDWINDOW, x,
-                                    y, 900, height, nullptr, nullptr, instance, nullptr);
+        int width = 900;
+        if (app.settings.windowSaved) {
+            RECT previous{app.settings.windowX, app.settings.windowY,
+                          app.settings.windowX + app.settings.windowWidth,
+                          app.settings.windowY + app.settings.windowHeight};
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromRect(&previous, MONITOR_DEFAULTTONEAREST), &monitor))
+                workArea = monitor.rcWork;
+            width = std::max(900, std::min(app.settings.windowWidth, int(workArea.right - workArea.left)));
+            height = std::max(650, std::min(app.settings.windowHeight, int(workArea.bottom - workArea.top)));
+            x = std::clamp(app.settings.windowX, int(workArea.left),
+                           std::max(int(workArea.left), int(workArea.right) - width));
+            y = std::clamp(app.settings.windowY, int(workArea.top),
+                           std::max(int(workArea.top), int(workArea.bottom) - height));
+        }
+        HWND window = CreateWindowW(cls.lpszClassName, L"CloudScreenTransfer 0.2.0", WS_OVERLAPPEDWINDOW, x,
+                                    y, width, height, nullptr, nullptr, instance, nullptr);
         if (!window)
             throw std::runtime_error("Cannot create window");
+        app.initializing = false;
+        if (!app.settingsWarning.empty())
+            log(app.settingsWarning);
         if (app.smoke) {
-            app.smokeResult = smoke() ? 0 : 1;
+            bool valid = app.settingsSmoke
+                             ? sender() && textOf(item(PathEdit)) == app.settings.source &&
+                                   textOf(item(ProcessEdit)) == L"SavedVDI.exe" &&
+                                   app.settings.encoding == cst::Encoding{900, 500, 3, 8, 64, 64} &&
+                                   app.settings.sendFps == 8 &&
+                                   cst::advancedSettingsSmoke(app.window, app.font, app.settings)
+                         : app.senderSmoke ? senderSmoke()
+                                           : smoke();
+            app.smokeResult = valid ? 0 : 1;
             DestroyWindow(window);
         } else {
             ShowWindow(window, show);
@@ -715,9 +1073,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             DeleteObject(app.heading);
         CoUninitialize();
         return app.smoke ? app.smokeResult : 0;
-    } catch (const std::exception &error) {
+    } catch (...) {
+        app.stopped = true;
+        if (app.worker.joinable())
+            app.worker.join();
+        bool ignored = false;
+        auto error = describeFailure(std::current_exception(), ignored);
         if (!app.smoke)
-            MessageBoxW(nullptr, widen(error.what()).c_str(), L"启动失败", MB_OK | MB_ICONERROR);
+            MessageBoxW(nullptr, error.c_str(), L"启动失败", MB_OK | MB_ICONERROR);
         CoUninitialize();
         return 1;
     }

@@ -1,6 +1,9 @@
 /* This code is subject to the Mozilla Public License, v.2.0. http://mozilla.org/MPL/2.0/. */
 #include "file_transfer.h"
 #include "protocol.h"
+#include "frame_codec.h"
+#include "image_runtime.h"
+#include "settings.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -11,6 +14,7 @@
 #include <memory>
 #include <sstream>
 #include <iomanip>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 #include <cstring>
@@ -638,6 +642,160 @@ void highOffsetCase(const std::wstring &root) {
               count == PayloadBytes && actualChunk == chunkBytes,
           "actual receiver writes correct bytes beyond 4 GiB");
 }
+void advancedCases(const std::wstring &root) {
+    const Encoding profiles[] = {{900, 500, 3, 8, 64, 16},    {900, 400, 4, 2, 16, 16},
+                                 {1024, 620, 5, 4, 24, 32},   {1000, 600, 2, 16, 32, 64},
+                                 {1280, 720, 2, 8, 48, 64},   {1000, 600, 8, 16, 64, 16},
+                                 {1920, 1080, 2, 16, 64, 16}, {900, 300, 2, 2, 64, 16}};
+    for (unsigned i = 0; i < std::size(profiles); ++i) {
+        const auto e = profiles[i];
+        e.validate();
+        auto dir = path(root, L"advanced-" + std::to_wstring(i));
+        directory(dir);
+        auto out = path(dir, L"out");
+        directory(out);
+        auto source = path(dir, L"编码参数.bin");
+        auto bytes = pattern(i < 2 ? size_t(e.windowBytes()) + e.payloadBytes() + 3 : 70001, 0x182abf + i);
+        writeFile(source, bytes);
+        Sender sender(source, {}, {}, e);
+        uint64_t fresh = 0;
+        auto makeReceiver = [&] {
+            return std::make_unique<Receiver>(out, [&](const Progress &p) { fresh += p.newBytes; });
+        };
+        auto receiver = makeReceiver();
+        FrameCodec codec;
+        bool resumed = false;
+        for (unsigned frame = 0; frame < 2500 && !sender.complete(); ++frame) {
+            auto wire = sender.next(frame);
+            auto pixels = codec.encode(wire);
+            cv::Mat bgra;
+            grayToBgra(pixels, bgra);
+            // Exercise the actual BGRA capture decoder, with offset/strided storage.
+            cv::Mat desktop(int(e.height) + 23, int(e.width) + 39, CV_8UC4, cv::Scalar(7, 11, 19, 255));
+            bgra.copyTo(desktop(cv::Rect(17, 9, int(e.width), int(e.height))));
+            auto decoded = codec.decode(desktop);
+            check(decoded.valid && decoded.canvas == cv::Rect(17, 9, int(e.width), int(e.height)) &&
+                      decoded.frame.info.encoding == e,
+                  "header automatically detects custom encoding");
+            if (frame % 9 != 7)
+                receiver->ingest(decoded.frame);
+            Feedback reply;
+            check(parseFeedback(formatFeedback(receiver->feedback()), reply),
+                  "custom profile keyboard feedback roundtrip");
+            sender.feedback(reply);
+            if (i == 0 && !resumed && !receiver->complete() && receiver->progress().done > bytes.size() / 3) {
+                receiver->save();
+                receiver.reset();
+                receiver = makeReceiver();
+                resumed = true;
+            }
+        }
+        check(sender.complete() && receiver->complete(),
+              "custom encoding completes through image/CRC/file/SHA");
+        check(fresh == bytes.size() && readFile(receiver->progress().path) == bytes,
+              "custom profile resume preserves exact unique bytes");
+        check(i != 0 || resumed, "custom encoding really exercised checkpoint restart");
+    }
+    Manifest a;
+    a.filename = "same.bin";
+    a.size = 123;
+    auto b = a;
+    b.encoding = profiles[0];
+    check(transferId(a) != transferId(b), "encoding layouts have independent checkpoint identities");
+    auto bad = profiles[0];
+    bad.levels = 3;
+    bool rejected = false;
+    try {
+        bad.validate();
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    check(rejected, "unsupported gray count rejected");
+    bad = {900, 300, 8, 2, 64, 16};
+    rejected = false;
+    try {
+        bad.validate();
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    check(rejected, "insufficient optical capacity rejected before transfer");
+    std::cout
+        << "Advanced encoding: 8 optical file profiles, loss, checkpoint restart and exact SHA passed.\n";
+}
+void settingsCase(const std::wstring &root) {
+    auto name = path(root, L"用户参数.ini");
+    std::wstring warning;
+    auto defaults = loadSettings(name, warning);
+    check(warning.empty() && defaults.encoding == Encoding{} && defaults.clickCanvas &&
+              defaults.feedbackEnabled,
+          "missing settings preserve working recommended defaults");
+    Settings s;
+    s.encoding = {900, 500, 3, 8, 64, 64};
+    s.send = true;
+    s.sendFps = 8;
+    s.captureFps = 31;
+    s.progressAckMs = 5555;
+    s.controlAckMs = 1600;
+    s.keyHoldMs = 17;
+    s.keyGapMs = 23;
+    s.imageFreshMs = 1400;
+    s.keyMode = FeedbackKeyMode::Unicode;
+    s.clickCanvas = false;
+    s.restoreMouse = true;
+    s.feedbackEnabled = false;
+    s.source = L"C:\\中文目录\\测试文件.bin";
+    s.directory = L"D:\\保存目录 空格";
+    s.process = L"AnotherVDI.exe";
+    s.windowSaved = true;
+    s.windowX = -1500;
+    s.windowY = 70;
+    s.windowWidth = 1040;
+    s.windowHeight = 720;
+    saveSettings(name, s);
+    auto actual = loadSettings(name, warning);
+    check(warning.empty() && actual.encoding == s.encoding && actual.send == s.send &&
+              actual.source == s.source && actual.directory == s.directory && actual.process == s.process &&
+              actual.sendFps == s.sendFps && actual.captureFps == s.captureFps &&
+              actual.progressAckMs == s.progressAckMs && actual.controlAckMs == s.controlAckMs &&
+              actual.keyHoldMs == s.keyHoldMs && actual.keyGapMs == s.keyGapMs &&
+              actual.imageFreshMs == s.imageFreshMs && actual.keyMode == s.keyMode &&
+              actual.clickCanvas == s.clickCanvas && actual.restoreMouse == s.restoreMouse &&
+              actual.feedbackEnabled == s.feedbackEnabled && actual.windowSaved &&
+              actual.windowX == s.windowX && actual.windowY == s.windowY &&
+              actual.windowWidth == s.windowWidth && actual.windowHeight == s.windowHeight,
+          "all encoding/timing/Unicode paths/main options survive disk reload");
+    s.sendFps = 12;
+    s.encoding.levels = 16;
+    saveSettings(name, s);
+    actual = loadSettings(name, warning);
+    check(actual.sendFps == 12 && actual.encoding.levels == 16,
+          "atomic replacement invalidates cached INI values");
+    {
+        TestHandle held(CreateFileW(name.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr));
+        check(held.value != INVALID_HANDLE_VALUE, "open previous settings snapshot");
+        auto replacement = s;
+        replacement.sendFps = 19;
+        bool rejected = false;
+        try {
+            saveSettings(name, replacement);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        check(rejected, "a locked settings file reports failed commit");
+    }
+    check(loadSettings(name, warning).sendFps == 12, "failed commit preserves previous settings");
+    check(WritePrivateProfileStringW(L"Encoding", L"Levels", L"3", name.c_str()) != 0,
+          "write corrupt settings fixture");
+    check(WritePrivateProfileStringW(L"Timing", L"SendFps", L"999", name.c_str()) != 0,
+          "write corrupt timing fixture");
+    actual = loadSettings(name, warning);
+    check(!warning.empty() && actual.encoding == Encoding{} && actual.sendFps == 5 &&
+              actual.source == s.source,
+          "invalid saved values recover defaults without losing main options");
+    std::cout << "Settings: all options, Unicode persistence, atomic replacement/failure and invalid-value "
+                 "recovery passed.\n";
+}
 } // namespace
 void fileTransferSelfTest() {
     TestDirectory directory;
@@ -659,5 +817,7 @@ void fileTransferSelfTest() {
     run("receive cancellation", receiveCancelCase);
     run("final hash rejection", hashMismatchCase);
     run("64-bit offsets", highOffsetCase);
+    run("advanced optical profiles", advancedCases);
+    run("persistent options", settingsCase);
 }
 } // namespace cst

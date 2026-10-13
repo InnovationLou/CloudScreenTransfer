@@ -8,7 +8,8 @@ class Sender {
     std::unique_ptr<Impl> impl;
 
   public:
-    Sender(const std::wstring &source, ProgressCallback progress = {}, Cancel cancel = {});
+    Sender(const std::wstring &source, ProgressCallback progress = {}, Cancel cancel = {},
+           Encoding encoding = {});
     ~Sender();
     Sender(const Sender &) = delete;
     uint64_t id() const;

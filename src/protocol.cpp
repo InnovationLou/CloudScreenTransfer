@@ -51,9 +51,6 @@ void validSize(uint64_t size) {
 uint64_t ceilDiv(uint64_t value, uint64_t divisor) {
     return value / divisor + unsigned(value % divisor != 0);
 }
-uint64_t maxPacketCount() {
-    return ManifestSlots + ceilDiv(MaxFileSize, PayloadBytes);
-}
 
 // Win32 component rules: https://learn.microsoft.com/windows/win32/fileio/naming-a-file
 void validFilename(const std::string &name) {
@@ -117,8 +114,7 @@ void validateFeedback(const Feedback &feedback) {
         if (op == 'D')
             require(feedback.transfer != 0, "Done feedback has no transfer ID");
     } else {
-        require(feedback.transfer != 0 &&
-                    feedback.window <= ceilDiv(ceilDiv(MaxFileSize, PayloadBytes), WindowChunks),
+        require(feedback.transfer != 0 && feedback.window <= MaxFileSize,
                 "Progress feedback transfer/window outside protocol range");
     }
 }
@@ -167,8 +163,17 @@ uint64_t transferId(const Manifest &manifest) {
         value ^= byte;
         value *= 1099511628211ull;
     };
-    for (char c : std::string("CST1ID"))
+    manifest.encoding.validate();
+    for (char c : std::string(manifest.encoding.legacy() ? "CST1ID" : "CST2ID"))
         append(uint8_t(c));
+    if (!manifest.encoding.legacy()) {
+        for (unsigned n :
+             {manifest.encoding.width, manifest.encoding.height, manifest.encoding.cell,
+              manifest.encoding.levels, manifest.encoding.parity, manifest.encoding.windowFrames}) {
+            append(uint8_t(n));
+            append(uint8_t(n >> 8));
+        }
+    }
     for (uint8_t byte : manifest.sha)
         append(byte);
     for (unsigned i = 0; i < 8; ++i)
@@ -222,30 +227,50 @@ ManifestWire encodeManifest(const Manifest &manifest) {
     validFilename(manifest.filename);
     ManifestWire out{};
     std::copy_n("CSTF", 4, out.begin());
-    put16(out.data() + 4, Version);
+    const auto &e = manifest.encoding;
+    e.validate();
+    put16(out.data() + 4, e.legacy() ? Version : 2);
     put16(out.data() + 6, ManifestHeaderBytes);
-    const uint16_t config[] = {ManifestBytes, CanvasWidth,  CanvasHeight, Slots,         CodeBytes,
-                               ParityBytes,   MessageBytes, PayloadBytes, ManifestSlots, WindowFrames};
+    const unsigned config[] = {ManifestBytes,     e.width,       e.height,         e.slots(),
+                               CodeBytes,         e.parity,      e.messageBytes(), e.payloadBytes(),
+                               e.manifestSlots(), e.windowFrames};
     for (size_t i = 0; i < 10; ++i)
-        put16(out.data() + 8 + i * 2, config[i]);
+        put16(out.data() + 8 + i * 2, uint16_t(config[i]));
     put64(out.data() + 28, manifest.size);
     put64(out.data() + 36, transferId(manifest));
     std::copy(manifest.sha.begin(), manifest.sha.end(), out.begin() + 44);
     put16(out.data() + 76, uint16_t(manifest.filename.size()));
+    if (!e.legacy()) {
+        out[78] = uint8_t(e.cell);
+        out[79] = uint8_t(e.levels);
+    }
     std::copy(manifest.filename.begin(), manifest.filename.end(), out.begin() + ManifestHeaderBytes);
     put32(out.data() + out.size() - 4, crc32(out.data(), out.size() - 4));
     return out;
 }
 Manifest decodeManifest(const ManifestWire &bytes) {
-    require(std::equal(bytes.begin(), bytes.begin() + 4, "CSTF") && get16(bytes.data() + 4) == Version &&
-                get16(bytes.data() + 6) == ManifestHeaderBytes && get16(bytes.data() + 78) == 0 &&
+    const unsigned version = get16(bytes.data() + 4);
+    require(std::equal(bytes.begin(), bytes.begin() + 4, "CSTF") && (version == Version || version == 2) &&
+                get16(bytes.data() + 6) == ManifestHeaderBytes &&
                 get32(bytes.data() + bytes.size() - 4) == crc32(bytes.data(), bytes.size() - 4),
             "Manifest magic/version/reserved/CRC failure");
-    const uint16_t config[] = {ManifestBytes, CanvasWidth,  CanvasHeight, Slots,         CodeBytes,
-                               ParityBytes,   MessageBytes, PayloadBytes, ManifestSlots, WindowFrames};
+    Manifest manifest;
+    auto &e = manifest.encoding;
+    if (version == 2) {
+        e.width = get16(bytes.data() + 10);
+        e.height = get16(bytes.data() + 12);
+        e.parity = get16(bytes.data() + 18);
+        e.windowFrames = get16(bytes.data() + 26);
+        e.cell = bytes[78];
+        e.levels = bytes[79];
+        e.validate();
+    } else
+        require(get16(bytes.data() + 78) == 0, "Manifest reserved fields are not zero");
+    const unsigned config[] = {ManifestBytes,     e.width,       e.height,         e.slots(),
+                               CodeBytes,         e.parity,      e.messageBytes(), e.payloadBytes(),
+                               e.manifestSlots(), e.windowFrames};
     for (size_t i = 0; i < 10; ++i)
         require(get16(bytes.data() + 8 + i * 2) == config[i], "Unsupported manifest transport configuration");
-    Manifest manifest;
     manifest.size = get64(bytes.data() + 28);
     validSize(manifest.size);
     std::copy_n(bytes.begin() + 44, manifest.sha.size(), manifest.sha.begin());
@@ -261,27 +286,45 @@ Manifest decodeManifest(const ManifestWire &bytes) {
     return manifest;
 }
 PacketWire encodePacket(const Packet &packet) {
-    require(packet.index < maxPacketCount(), "Packet index exceeds protocol file range");
+    auto bytes = encodePacket(packet, Encoding{});
+    PacketWire out{};
+    std::copy(bytes.begin(), bytes.end(), out.begin());
+    return out;
+}
+std::vector<uint8_t> encodePacket(const Packet &packet, const Encoding &encoding) {
+    encoding.validate();
+    require(packet.index < encoding.manifestSlots() + ceilDiv(MaxFileSize, encoding.payloadBytes()),
+            "Packet index exceeds protocol file range");
+    require(packet.data.size() == encoding.payloadBytes(), "Packet payload differs from encoding profile");
     if (!packet.transfer)
         require(packet.index == 0 &&
                     std::all_of(packet.data.begin(), packet.data.end(), [](uint8_t byte) { return !byte; }),
                 "Only all-zero padding may have zero transfer ID");
-    PacketWire out{};
+    std::vector<uint8_t> out(encoding.messageBytes(), 0);
     put64(out.data(), packet.transfer);
     put64(out.data() + 8, packet.index);
     std::copy(packet.data.begin(), packet.data.end(), out.begin() + 16);
-    put32(out.data() + MessageBytes - 4, crc32(out.data(), MessageBytes - 4));
+    put32(out.data() + out.size() - 4, crc32(out.data(), out.size() - 4));
     return out;
 }
 bool decodePacket(const PacketWire &bytes, Packet &packet) {
-    if (get32(bytes.data() + MessageBytes - 4) != crc32(bytes.data(), MessageBytes - 4))
+    return decodePacket(bytes.data(), bytes.size(), packet, Encoding{});
+}
+bool decodePacket(const uint8_t *bytes, size_t size, Packet &packet, const Encoding &encoding) {
+    try {
+        encoding.validate();
+    } catch (const std::invalid_argument &) {
+        return false;
+    }
+    if (!bytes || size != encoding.messageBytes() || get32(bytes + size - 4) != crc32(bytes, size - 4))
         return false;
     Packet candidate;
-    candidate.transfer = get64(bytes.data());
-    candidate.index = get64(bytes.data() + 8);
-    if (!candidate.transfer || candidate.index >= maxPacketCount())
+    candidate.transfer = get64(bytes);
+    candidate.index = get64(bytes + 8);
+    if (!candidate.transfer ||
+        candidate.index >= encoding.manifestSlots() + ceilDiv(MaxFileSize, encoding.payloadBytes()))
         return false;
-    std::copy_n(bytes.begin() + 16, PayloadBytes, candidate.data.begin());
+    candidate.data.assign(bytes + 16, bytes + size - 4);
     packet = candidate;
     return true;
 }

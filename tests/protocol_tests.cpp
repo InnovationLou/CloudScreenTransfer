@@ -233,7 +233,7 @@ void protocolSelfTest() {
     rejects([&] { formatFeedback(request); }, "Progress needs transfer ID");
     feedback.window = windowCount(maximum);
     check(parseFeedback(formatFeedback(feedback), parsed), "Completed-prefix progress accepted");
-    ++feedback.window;
+    feedback.window = (std::numeric_limits<int64_t>::max)() + uint64_t(1);
     rejects([&] { formatFeedback(feedback); }, "Feedback oversized window");
     FeedbackParser stream;
     unsigned recovered = 0;

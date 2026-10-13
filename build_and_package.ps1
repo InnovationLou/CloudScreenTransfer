@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 $projectRoot = [IO.Path]::GetFullPath($PSScriptRoot)
+$projectVersion = '0.2.0'
 
 function Resolve-ProjectChild([string]$value) {
     $resolved = [IO.Path]::GetFullPath((Join-Path $projectRoot $value))
@@ -63,7 +64,7 @@ Check-Exit 'PE dependency inspection'
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
 $runRoot = Join-Path $outputRoot $stamp
-$name = 'CloudScreenTransfer-0.1.0-win7-x64'
+$name = "CloudScreenTransfer-$projectVersion-win7-x64"
 $package = Join-Path $runRoot $name
 if (Test-Path -LiteralPath $runRoot) { throw 'Package output already exists; refusing to replace it.' }
 New-Item -ItemType Directory -Path $package | Out-Null
@@ -72,9 +73,11 @@ foreach ($filename in @('README.md', 'LICENSE', 'THIRD_PARTY.md')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $filename) -Destination $package
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs') -Destination $package -Recurse
-# Windows PowerShell 5 writes a UTF-8 BOM, allowing Win7 Notepad to read Chinese.
-Get-Content -LiteralPath (Join-Path $projectRoot 'USAGE_ZH.txt') -Encoding UTF8 |
-    Set-Content -LiteralPath (Join-Path $package 'USAGE_ZH.txt') -Encoding UTF8
+# Explicit BOM works with both Windows PowerShell 5 and PowerShell 7, allowing
+# Win7 Notepad to read Chinese regardless of which shell builds the package.
+[IO.File]::WriteAllText((Join-Path $package 'USAGE_ZH.txt'),
+    [IO.File]::ReadAllText((Join-Path $projectRoot 'USAGE_ZH.txt'), [Text.Encoding]::UTF8),
+    [Text.UTF8Encoding]::new($true))
 New-Item -ItemType Directory -Path (Join-Path $package 'licenses') | Out-Null
 Copy-Item -LiteralPath $opencvNotice -Destination (Join-Path $package 'licenses\OpenCV-installed.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\libcorrect\LICENSE') -Destination (Join-Path $package 'licenses\libcorrect.txt')
@@ -84,7 +87,7 @@ New-Item -ItemType Directory -Path (Join-Path $package 'third_party\libcorrect')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\libcorrect\LICENSE') -Destination (Join-Path $package 'third_party\libcorrect')
 @(
     'Source: https://github.com/InnovationLou/CloudScreenTransfer',
-    'Version: 0.1.0',
+    "Version: $projectVersion",
     'Run: double-click CloudScreenTransfer.exe; choose sender or receiver in the GUI.',
     'The ZIP is portable; no OpenCV DLLs or Python runtime are required.'
 ) | Set-Content -LiteralPath (Join-Path $package 'SOURCE.txt') -Encoding UTF8

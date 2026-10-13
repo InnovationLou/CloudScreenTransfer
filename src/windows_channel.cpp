@@ -1,6 +1,7 @@
 /* This code is subject to the Mozilla Public License, v.2.0. http://mozilla.org/MPL/2.0/. */
 #include "windows_channel.h"
 #include "protocol.h"
+#include "image_runtime.h"
 #include <tlhelp32.h>
 #include <imm.h>
 #include <opencv2/imgproc.hpp>
@@ -27,7 +28,8 @@ BOOL CALLBACK chooseClient(HWND window, LPARAM parameter) {
     if (!search.processes.count(process) || !IsWindowVisible(window) || IsIconic(window))
         return TRUE;
     RECT rect{};
-    if (!GetClientRect(window, &rect) || rect.right < LONG(CanvasWidth) || rect.bottom < LONG(CanvasHeight))
+    if (!GetClientRect(window, &rect) || rect.right < LONG(MinCanvasWidth) ||
+        rect.bottom < LONG(MinCanvasHeight))
         return TRUE;
     uint64_t area = uint64_t(rect.right) * uint64_t(rect.bottom);
     if (area > search.area) {
@@ -140,7 +142,7 @@ struct Capture::Impl {
         if (!GetClientRect(target, &rect) || !ClientToScreen(target, &origin))
             return {};
         int w = rect.right, h = rect.bottom;
-        if (w < int(CanvasWidth) || h < int(CanvasHeight) || w > 16384 || h > 16384)
+        if (w < int(MinCanvasWidth) || h < int(MinCanvasHeight) || w > 16384 || h > 16384)
             return {};
         int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -183,6 +185,7 @@ cv::Mat Capture::take(HWND target) {
 }
 
 struct Canvas::Impl {
+    Encoding encoding;
     HWND window = nullptr;
     DWORD thread = GetCurrentThreadId();
     bool alive = true, wrongSize = false;
@@ -190,6 +193,33 @@ struct Canvas::Impl {
     FeedbackParser parser;
     std::function<void(const Feedback &)> callback;
     std::exception_ptr callbackError;
+    void pasteFeedback() {
+        if (!OpenClipboard(window))
+            return;
+        struct Close {
+            ~Close() { CloseClipboard(); }
+        } close;
+        HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+        if (!handle)
+            return;
+        const auto *text = static_cast<const wchar_t *>(GlobalLock(handle));
+        if (!text)
+            return;
+        struct Unlock {
+            HANDLE handle;
+            ~Unlock() { GlobalUnlock(handle); }
+        } unlock{handle};
+        const size_t limit = std::min<size_t>(GlobalSize(handle) / sizeof(wchar_t), FeedbackWireChars + 3);
+        std::string value;
+        for (size_t i = 0; i < limit && text[i]; ++i) {
+            if (text[i] > 127)
+                return;
+            value.push_back(char(text[i]));
+        }
+        Feedback command;
+        if (parseFeedback(value, command) && callback)
+            callback(command);
+    }
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         auto self = reinterpret_cast<Impl *>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -202,7 +232,8 @@ struct Canvas::Impl {
         if (message == WM_ERASEBKGND)
             return 1;
         if (message == WM_SIZE && wparam != SIZE_MINIMIZED) {
-            self->wrongSize = LOWORD(lparam) != CanvasWidth || HIWORD(lparam) != CanvasHeight;
+            self->wrongSize =
+                LOWORD(lparam) != self->encoding.width || HIWORD(lparam) != self->encoding.height;
             return 0;
         }
         if (message == WM_PAINT) {
@@ -211,13 +242,13 @@ struct Canvas::Impl {
             if (!self->pixels.empty() && !self->wrongSize) {
                 BITMAPINFO info{};
                 info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                info.bmiHeader.biWidth = CanvasWidth;
-                info.bmiHeader.biHeight = -LONG(CanvasHeight);
+                info.bmiHeader.biWidth = self->encoding.width;
+                info.bmiHeader.biHeight = -LONG(self->encoding.height);
                 info.bmiHeader.biPlanes = 1;
                 info.bmiHeader.biBitCount = 32;
                 info.bmiHeader.biCompression = BI_RGB;
-                SetDIBitsToDevice(dc, 0, 0, CanvasWidth, CanvasHeight, 0, 0, 0, CanvasHeight,
-                                  self->pixels.data, &info, DIB_RGB_COLORS);
+                SetDIBitsToDevice(dc, 0, 0, self->encoding.width, self->encoding.height, 0, 0, 0,
+                                  self->encoding.height, self->pixels.data, &info, DIB_RGB_COLORS);
                 GdiFlush();
             } else
                 FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
@@ -226,6 +257,10 @@ struct Canvas::Impl {
         }
         if (message == WM_CHAR) {
             try {
+                if (wparam == 22) {
+                    self->pasteFeedback();
+                    return 0;
+                }
                 char character = wparam < 128 ? char(wparam) : 0;
                 if (character >= 'a' && character <= 'z')
                     character -= char('a' - 'A');
@@ -236,6 +271,14 @@ struct Canvas::Impl {
                         self->callback(*command);
                 } else
                     self->parser.reset();
+            } catch (...) {
+                self->callbackError = std::current_exception();
+            }
+            return 0;
+        }
+        if (message == WM_PASTE) {
+            try {
+                self->pasteFeedback();
             } catch (...) {
                 self->callbackError = std::current_exception();
             }
@@ -256,7 +299,9 @@ struct Canvas::Impl {
         }
         return DefWindowProcW(window, message, wparam, lparam);
     }
-    explicit Impl(std::function<void(const Feedback &)> feedback) : callback(std::move(feedback)) {
+    Impl(std::function<void(const Feedback &)> feedback, bool visible, Encoding configured)
+        : encoding(configured), callback(std::move(feedback)) {
+        encoding.validate();
         SetProcessDPIAware();
         WNDCLASSW cls{};
         cls.lpfnWndProc = procedure;
@@ -267,12 +312,12 @@ struct Canvas::Impl {
         if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
             throw windowsError("Cannot register optical canvas");
         constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        RECT outer{0, 0, LONG(CanvasWidth), LONG(CanvasHeight)}, work{};
+        RECT outer{0, 0, LONG(encoding.width), LONG(encoding.height)}, work{};
         if (!AdjustWindowRect(&outer, style, FALSE) || !SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0))
             throw windowsError("Cannot size optical canvas");
         int width = outer.right - outer.left, height = outer.bottom - outer.top;
         if (width > work.right - work.left || height > work.bottom - work.top)
-            throw std::runtime_error("The 1000x600 canvas does not fit this desktop at native size");
+            throw std::runtime_error("The configured canvas does not fit this desktop at native size");
         int x = work.left + (work.right - work.left - width) / 2,
             y = work.top + (work.bottom - work.top - height) / 2;
         window = CreateWindowExW(0, CanvasClass, L"CloudScreen Transfer - keep this window visible", style, x,
@@ -280,14 +325,16 @@ struct Canvas::Impl {
         if (!window)
             throw windowsError("Cannot create optical canvas");
         RECT client{};
-        if (!GetClientRect(window, &client) || client.right != LONG(CanvasWidth) ||
-            client.bottom != LONG(CanvasHeight)) {
+        if (!GetClientRect(window, &client) || client.right != LONG(encoding.width) ||
+            client.bottom != LONG(encoding.height)) {
             DestroyWindow(window);
-            throw std::runtime_error("The optical canvas must remain exactly 1000x600 pixels");
+            throw std::runtime_error("The optical canvas must remain at its configured native size");
         }
         ImmAssociateContext(window, nullptr); // Canvas only; leave other apps and system settings alone.
-        ShowWindow(window, SW_SHOWNORMAL);
-        UpdateWindow(window);
+        if (visible) {
+            ShowWindow(window, SW_SHOWNORMAL);
+            UpdateWindow(window);
+        }
     }
     ~Impl() {
         if (window) {
@@ -306,7 +353,8 @@ struct Canvas::Impl {
             throw std::runtime_error("Canvas must be used on its creating worker thread");
     }
 };
-Canvas::Canvas(std::function<void(const Feedback &)> feedback) : impl(new Impl(std::move(feedback))) {}
+Canvas::Canvas(std::function<void(const Feedback &)> feedback, bool visible, Encoding encoding)
+    : impl(new Impl(std::move(feedback), visible, encoding)) {}
 Canvas::~Canvas() = default;
 void Canvas::display(const cv::Mat &gray) {
     impl->requireThread();
@@ -314,9 +362,12 @@ void Canvas::display(const cv::Mat &gray) {
         return;
     if (impl->wrongSize)
         throw std::runtime_error("The optical canvas was resized; native pixels are required");
-    if (gray.type() != CV_8UC1 || gray.cols != int(CanvasWidth) || gray.rows != int(CanvasHeight))
-        throw std::invalid_argument("Canvas expects a native 1000x600 grayscale frame");
-    cv::cvtColor(gray, impl->pixels, cv::COLOR_GRAY2BGRA); // Owned pixels survive the caller's next frame.
+    if (gray.type() != CV_8UC1 || gray.cols != int(impl->encoding.width) ||
+        gray.rows != int(impl->encoding.height))
+        throw std::invalid_argument("Canvas expects a grayscale frame at the configured native size");
+    // Avoid the Concurrency scheduler entirely in the sender's first-frame
+    // conversion, including when this canvas is used on a background thread.
+    grayToBgra(gray, impl->pixels); // Owned pixels survive the caller's next frame.
     RedrawWindow(impl->window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     GdiFlush();
 }
@@ -337,7 +388,7 @@ bool Canvas::poll() {
 }
 
 bool sendFeedback(HWND target, const cv::Rect &canvas, const std::string &wire, Cancel interrupted,
-                  std::wstring &failure) {
+                  std::wstring &failure, const Settings &settings) {
     failure.clear();
     Feedback parsed;
     try {
@@ -376,14 +427,14 @@ bool sendFeedback(HWND target, const cv::Rect &canvas, const std::string &wire, 
             return false;
         }
         RECT client{};
-        if (canvas.width != int(CanvasWidth) || canvas.height != int(CanvasHeight) || canvas.x < 0 ||
+        if (canvas.width < int(MinCanvasWidth) || canvas.height < int(MinCanvasHeight) || canvas.x < 0 ||
             canvas.y < 0 || !GetClientRect(target, &client) ||
             int64_t(canvas.x) + canvas.width > client.right ||
             int64_t(canvas.y) + canvas.height > client.bottom) {
             failure = L"云端画布位置无效";
             return false;
         }
-        POINT point{canvas.x + 500, canvas.y + 12};
+        POINT point{canvas.x + canvas.width / 2, canvas.y + 12};
         if (!ClientToScreen(target, &point)) {
             failure = L"无法定位云端画布";
             return false;
@@ -402,34 +453,50 @@ bool sendFeedback(HWND target, const cv::Rect &canvas, const std::string &wire, 
         failure = L"请松开鼠标按键后重试反馈";
         return false;
     }
-    POINT focus{canvas.x + 500, canvas.y + 12};
-    if (!ClientToScreen(target, &focus) || !SetCursorPos(focus.x, focus.y)) {
-        failure = L"无法点击云端画布";
-        return false;
+    POINT focus{canvas.x + canvas.width / 2, canvas.y + 12};
+    POINT previous{};
+    bool havePrevious = GetCursorPos(&previous) != FALSE;
+    struct RestorePointer {
+        POINT previous, expected;
+        bool active;
+        ~RestorePointer() {
+            POINT current{};
+            if (active && GetCursorPos(&current) && current.x == expected.x && current.y == expected.y)
+                SetCursorPos(previous.x, previous.y);
+        }
+    } restore{previous, {}, false};
+    bool stillSafe = false, released = false;
+    if (settings.clickCanvas) {
+        if (!ClientToScreen(target, &focus) || !SetCursorPos(focus.x, focus.y)) {
+            failure = L"无法点击云端画布";
+            return false;
+        }
+        if (!guard())
+            return false;
+        POINT actual{};
+        if (!GetCursorPos(&actual) || actual.x != focus.x || actual.y != focus.y) {
+            failure = L"反馈点击前鼠标位置已改变";
+            return false;
+        }
+        if (!inputMouse(MOUSEEVENTF_LEFTDOWN)) {
+            inputMouse(MOUSEEVENTF_LEFTUP);
+            failure = L"云桌面未接收鼠标反馈";
+            return false;
+        }
+        InputRelease mouseRelease{0, true, true};
+        restore.expected = focus;
+        restore.active = settings.restoreMouse && havePrevious;
+        Sleep(settings.keyHoldMs);
+        stillSafe = guard();
+        released = mouseRelease.release(); // Release even if focus/cancel changed during the hold.
+        if (!stillSafe)
+            return false;
+        if (!released) {
+            failure = L"无法释放反馈鼠标按键";
+            return false;
+        }
+        Sleep(settings.keyGapMs);
     }
-    if (!guard())
-        return false;
-    POINT actual{};
-    if (!GetCursorPos(&actual) || actual.x != focus.x || actual.y != focus.y) {
-        failure = L"反馈点击前鼠标位置已改变";
-        return false;
-    }
-    if (!inputMouse(MOUSEEVENTF_LEFTDOWN)) {
-        inputMouse(MOUSEEVENTF_LEFTUP);
-        failure = L"云桌面未接收鼠标反馈";
-        return false;
-    }
-    InputRelease mouseRelease{0, true, true};
-    Sleep(8);
-    bool stillSafe = guard();
-    bool released = mouseRelease.release(); // Release even if focus/cancel changed during the hold.
-    if (!stillSafe)
-        return false;
-    if (!released) {
-        failure = L"无法释放反馈鼠标按键";
-        return false;
-    }
-    Sleep(12);
     for (char character : wire) {
         if (!guard())
             return false;
@@ -443,13 +510,50 @@ bool sendFeedback(HWND target, const cv::Rect &canvas, const std::string &wire, 
             failure = L"请松开正在按住的协议字符键";
             return false;
         }
-        if (!inputKey(scan, false)) {
-            inputKey(scan, true);
+        auto emitKey = [&](bool up) {
+            if (settings.keyMode == FeedbackKeyMode::Scan) {
+                bool ok = inputKey(scan, up);
+                if (up && !ok)
+                    keybd_event(BYTE(MapVirtualKeyW(scan, MAPVK_VSC_TO_VK)), BYTE(scan), KEYEVENTF_KEYUP, 0);
+                return ok;
+            }
+            INPUT event{};
+            event.type = INPUT_KEYBOARD;
+            if (settings.keyMode == FeedbackKeyMode::Unicode && character != '\r') {
+                event.ki.wScan = WORD(uint8_t(character));
+                event.ki.dwFlags = KEYEVENTF_UNICODE;
+            } else {
+                event.ki.wVk = key;
+                event.ki.wScan = scan;
+            }
+            if (up)
+                event.ki.dwFlags |= KEYEVENTF_KEYUP;
+            bool ok = SendInput(1, &event, sizeof(event)) == 1;
+            if (up && !ok)
+                keybd_event(BYTE((event.ki.dwFlags & KEYEVENTF_UNICODE) ? VK_PACKET : key), BYTE(scan),
+                            KEYEVENTF_KEYUP, 0);
+            return ok;
+        };
+        if (!emitKey(false)) {
+            emitKey(true);
             failure = L"云桌面未接收键盘反馈";
             return false;
         }
-        InputRelease keyRelease{scan, false, true};
-        Sleep(8);
+        struct ReleaseKey {
+            decltype(emitKey) &emit;
+            bool active = true;
+            bool release() {
+                if (!active)
+                    return true;
+                active = false;
+                return emit(true);
+            }
+            ~ReleaseKey() {
+                if (active)
+                    emit(true);
+            }
+        } keyRelease{emitKey};
+        Sleep(settings.keyHoldMs);
         stillSafe = guard();
         released = keyRelease.release(); // Never leave an injected key held on any interrupted path.
         if (!stillSafe)
@@ -458,7 +562,7 @@ bool sendFeedback(HWND target, const cv::Rect &canvas, const std::string &wire, 
             failure = L"无法释放反馈键盘按键";
             return false;
         }
-        Sleep(12);
+        Sleep(settings.keyGapMs);
     }
     return true;
 }

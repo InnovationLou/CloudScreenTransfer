@@ -19,6 +19,8 @@ ManifestWire encodeManifest(const Manifest &manifest);      // Throws on invalid
 Manifest decodeManifest(const ManifestWire &bytes);         // Throws on CRC/config/name/size failure.
 PacketWire encodePacket(const Packet &packet);              // Packet{} is permitted padding.
 bool decodePacket(const PacketWire &bytes, Packet &packet); // Rejects padding; output unchanged on failure.
+std::vector<uint8_t> encodePacket(const Packet &packet, const Encoding &encoding);
+bool decodePacket(const uint8_t *bytes, size_t size, Packet &packet, const Encoding &encoding);
 
 // Counts apply to DATA ONLY. Metadata uses separate repeated announce frames.
 uint64_t chunkCount(uint64_t size);

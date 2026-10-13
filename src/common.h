@@ -1,5 +1,6 @@
 /* This code is subject to the Mozilla Public License, v.2.0. http://mozilla.org/MPL/2.0/. */
 #pragma once
+#include "encoding.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -14,16 +15,17 @@ constexpr uint64_t WindowBytes = uint64_t(WindowChunks) * PayloadBytes;
 using Digest = std::array<uint8_t, 32>;
 struct Packet {
     uint64_t transfer = 0, index = 0;
-    std::array<uint8_t, PayloadBytes> data{};
+    std::vector<uint8_t> data = std::vector<uint8_t>(PayloadBytes, 0);
 };
 struct FrameInfo {
     uint64_t transfer = 0, window = 0;
     uint32_t sequence = 0;
     bool complete = false;
+    Encoding encoding;
 };
 struct WireFrame {
     FrameInfo info;
-    std::array<Packet, Slots> packets{};
+    std::vector<Packet> packets = std::vector<Packet>(Slots);
 };
 struct DecodedFrame {
     FrameInfo info;
@@ -33,6 +35,7 @@ struct Manifest {
     uint64_t size = 0;
     Digest sha{};
     std::string filename;
+    Encoding encoding;
 };
 struct Feedback {
     char operation = 'M';
